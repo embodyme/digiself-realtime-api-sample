@@ -1,0 +1,38 @@
+services:
+  livekit-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app:cached
+      - livekit_frontend_node_modules:/app/node_modules
+    environment:
+      - NODE_ENV=development
+      - VITE_OUTPUT_WEBSOCKET_URL=${OUTPUT_WEBSOCKET_URL}
+      - VITE_BACKEND_URL=${VITE_BACKEND_URL:-http://localhost:3000}
+    depends_on:
+      - livekit-backend
+
+  livekit-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./backend:/app
+      - livekit_backend_node_modules:/app/node_modules
+    environment:
+      - NODE_ENV=development
+      - OUTPUT_WEBSOCKET_URL=${OUTPUT_WEBSOCKET_URL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DIGISELF_API_KEY=${DIGISELF_API_KEY}
+      - AUDIO_FILE_URL=${AUDIO_FILE_URL}
+    restart: unless-stopped
+    command: "npm run dev"
+
+volumes:
+  livekit_frontend_node_modules:
+  livekit_backend_node_modules:

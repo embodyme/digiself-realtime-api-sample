@@ -1,0 +1,23 @@
+{
+  "name": "livekit-client-backend",
+  "version": "1.0.0",
+  "description": "Custom LiveKit Client Backend implementation in JavaScript",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@openai/agents": "^0.1.0",
+    "dotenv": "^16.4.7",
+    "ws": "^8.18.3",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13"
+  },
+  "author": "",
+  "license": "MIT"
+}

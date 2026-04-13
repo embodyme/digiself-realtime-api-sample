@@ -1,0 +1,22 @@
+{
+  "name": "meeting-bot-backend",
+  "version": "1.0.0",
+  "description": "Meeting Bot Backend implementation in JavaScript",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "dotenv": "^16.4.7",
+    "@openai/agents": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13"
+  },
+  "author": "",
+  "license": "MIT"
+}
