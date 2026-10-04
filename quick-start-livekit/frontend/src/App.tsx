@@ -1,6 +1,6 @@
 import { useState, useRef } from 'react';
-import { Room } from 'livekit-client';
-import { LiveKitRoom, RoomAudioRenderer } from '@livekit/components-react';
+import { Room, RoomEvent } from 'livekit-client';
+import { RoomAudioRenderer, RoomContext } from '@livekit/components-react';
 import { BrowserDirectConnection } from './browserDirect';
 import { VideoConference } from './VideoConference';
 import { LIVEKIT_SERVER_URL, BACKEND_URL, STREAM_API_URL } from './config';
@@ -16,7 +16,7 @@ export default function App() {
   const [avatarId, setAvatarId] = useState('');
 
   const [roomName, setRoomName] = useState('');
-  const [token, setToken] = useState('');
+  const [room, setRoom] = useState<Room | null>(null);
   const roomRef = useRef<Room | null>(null);
   const browserDirectRef = useRef<BrowserDirectConnection | null>(null);
 
@@ -30,7 +30,8 @@ export default function App() {
       const createRes = await fetch(`${BACKEND_URL}/api/rooms`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ avatar_id: avatarId, avatar_name: 'Avatar' }),
+        // interrupt_speech: false keeps the avatar talking when the user speaks (the API default is true)
+        body: JSON.stringify({ avatar_id: avatarId, avatar_name: 'Avatar', interrupt_speech: false }),
       });
 
       if (!createRes.ok) {
@@ -77,16 +78,23 @@ export default function App() {
       const { token: participantToken } = await tokenRes.json();
 
       // 4. Connect to Livekit
+      // This single connection is also used for rendering. Joining again with the same
+      // token would disconnect this one (duplicate identity) and drop the mic published below.
       setStatus('Connecting to Livekit...');
       const room = new Room();
       await room.connect(LIVEKIT_SERVER_URL, participantToken);
       roomRef.current = room;
+      room.on(RoomEvent.Disconnected, handleDisconnect);
+
+      // Start playing the avatar audio before the setup below (see HiddenRoomAudioPrewarm)
+      setRoom(room);
+      await waitForNextPaint();
 
       // 5. Publish the user's microphone to Livekit.
       //
-      // DigiSelf avatar uses the audio from Livekit to detect user speech and interrupt its own playback.
-      // Without publishing the mic to Livekit, the avatar will keep speaking even when the user starts talking.
-      // Publish the mic track here so interruption works end-to-end.
+      // With interrupt_speech: true (step 1), the DigiSelf avatar uses the audio from Livekit to detect
+      // user speech and interrupt its own playback. This sample turns interruption off, so the track
+      // is only used once interrupt_speech is set to true.
       await room.localParticipant.setMicrophoneEnabled(true);
 
       // 6. Start BrowserDirect
@@ -103,25 +111,35 @@ export default function App() {
       browserDirectRef.current = conn;
 
       setRoomName(roomData.room_name);
-      setToken(participantToken);
       setIsConnected(true);
       setStatus('Connected!');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Connection failed');
+      // Release whatever was set up before the failure
+      browserDirectRef.current?.close();
+      browserDirectRef.current = null;
+      roomRef.current?.disconnect();
+      roomRef.current = null;
     } finally {
       setIsConnecting(false);
     }
   };
 
-  const handleDisconnect = () => {
+  // Also runs when the room is closed from the server side. Safe to call twice:
+  // the refs are cleared before disconnecting, which fires this handler again.
+  // The error is kept so that a failed setup still shows why; handleConnect clears it.
+  function handleDisconnect() {
     browserDirectRef.current?.close();
-    roomRef.current?.disconnect();
+    browserDirectRef.current = null;
+    const currentRoom = roomRef.current;
+    roomRef.current = null;
+    currentRoom?.disconnect();
+    setRoom(null);
     setIsConnected(false);
     setStatus('');
-    setError(null);
-  };
+  }
 
-  if (isConnected) {
+  if (isConnected && room) {
     return (
       <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
         <div style={{ padding: '10px', background: '#333', color: '#fff', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -136,15 +154,12 @@ export default function App() {
             Disconnect
           </button>
         </div>
-        <LiveKitRoom
-          token={token}
-          serverUrl={LIVEKIT_SERVER_URL}
-          connect={true}
-          style={{ flex: 1 }}
-        >
-          <VideoConference excludeSelf={true} />
-          <RoomAudioRenderer />
-        </LiveKitRoom>
+        <RoomContext.Provider value={room}>
+          <div data-lk-theme="default" style={{ flex: 1 }}>
+            <VideoConference excludeSelf={true} />
+            <RoomAudioRenderer />
+          </div>
+        </RoomContext.Provider>
       </div>
     );
   }
@@ -191,6 +206,36 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {room && <HiddenRoomAudioPrewarm room={room} />}
     </div>
   );
+}
+
+// Plays the avatar audio while BrowserDirect is still starting. Chrome keeps receiving
+// remote audio that no element plays and buffers it, so a renderer mounted seconds later
+// would start that far behind the avatar video and only slowly catch up.
+function HiddenRoomAudioPrewarm({ room }: { room: Room }) {
+  return (
+    <RoomContext.Provider value={room}>
+      <div
+        aria-hidden="true"
+        style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', opacity: 0, pointerEvents: 'none' }}
+      >
+        <RoomAudioRenderer />
+      </div>
+    </RoomContext.Provider>
+  );
+}
+
+// Resolves once the next frame has been painted. requestAnimationFrame does not run in
+// background tabs, so a timer resolves it there.
+function waitForNextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, 200);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      clearTimeout(timer);
+      resolve();
+    }));
+  });
 }

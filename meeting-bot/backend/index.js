@@ -253,6 +253,8 @@ function startHybridServer() {
             meeting_url,
             output_url,
             avatar_id,
+            // Keep the avatar talking when meeting participants speak (the API default is true)
+            interrupt_speech: false,
           }),
         });
 
@@ -344,7 +346,7 @@ function startHybridServer() {
 
             botConnections.set(botId, {
               session: null,
-              agent: null,
+              currentResponseId: null,
               streamWs: null,
               currentRequestId: null,
               audioRequestProcessed: false,

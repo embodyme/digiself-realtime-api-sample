@@ -11,6 +11,8 @@ import http from 'http';
 
 import {
   outputWsUrl,
+  openaiApiKey,
+  browserRealtimeSessionConfig,
   digiselfApiKey,
   digiselfApiBaseUrl,
   currentMode,
@@ -72,6 +74,42 @@ function sendJsonResponse(res, statusCode, data) {
     'Access-Control-Allow-Origin': '*'
   });
   res.end(JSON.stringify(data));
+}
+
+/* ---------- Audio Source Selection ---------- */
+
+/** A participant counts as present while its individual audio keeps arriving */
+const participantAudioTimeoutMs = 2000;
+
+/**
+ * Chooses which agent audio to forward to OpenAI.
+ * The agent sends the same speech twice: per participant ("individual") and in the
+ * room mix ("mixed"), which its mixer delivers 0.5-1 s later. Forwarding both garbles
+ * the model input. With one participant besides the avatar, forward that participant's
+ * individual audio for faster replies; otherwise forward the room mix so that
+ * everyone is heard.
+ *
+ * @param {object} clientData - The client connection data
+ * @param {object} payload - Audio message from the agent
+ * @returns {'individual' | 'mixed'} The audio type to forward
+ */
+function selectAudioSource(clientData, payload) {
+  const now = Date.now();
+  if (payload.type === 'individual') {
+    clientData.audioParticipants.set(payload.participant_id, now);
+  }
+  for (const [id, lastSeen] of clientData.audioParticipants) {
+    if (now - lastSeen > participantAudioTimeoutMs) {
+      clientData.audioParticipants.delete(id);
+    }
+  }
+
+  const source = clientData.audioParticipants.size === 1 ? 'individual' : 'mixed';
+  if (source !== clientData.audioSource) {
+    clientData.audioSource = source;
+    console.log(`[Audio] Forwarding ${source} audio for ${clientData.roomName} (${clientData.audioParticipants.size} participant(s) besides the avatar)`);
+  }
+  return source;
 }
 
 /* ---------- Hybrid HTTP/WebSocket Server ---------- */
@@ -211,6 +249,39 @@ function startHybridServer() {
       return;
     }
 
+    /* ---------- Browser Direct API ---------- */
+
+    // POST /api/openai/session - Issue an OpenAI ephemeral token for Browser Direct
+    if (req.url === '/api/openai/session' && req.method === 'POST') {
+      try {
+        const body = await parseRequestBody(req);
+        const mode = body.mode === 'audio' ? 'audio' : 'text';
+
+        const openaiResponse = await fetch('https://api.openai.com/v1/realtime/client_secrets', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${openaiApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ session: browserRealtimeSessionConfig(mode) }),
+        });
+
+        const responseText = await openaiResponse.text();
+        if (!openaiResponse.ok) {
+          console.error(`[OpenAI Session] Failed: ${openaiResponse.status} ${responseText}`);
+          sendJsonResponse(res, openaiResponse.status, { error: `Failed to create OpenAI session: ${responseText}` });
+          return;
+        }
+
+        console.log(`[OpenAI Session] Ephemeral token created (${mode} output)`);
+        sendJsonResponse(res, 200, JSON.parse(responseText));
+      } catch (error) {
+        console.error('[OpenAI Session] Error:', error);
+        sendJsonResponse(res, 500, { error: error.message });
+      }
+      return;
+    }
+
     /* ---------- Room Management API (Proxy to Digiself API) ---------- */
 
     // POST /api/rooms - Create a new room (returns job_id immediately)
@@ -234,7 +305,8 @@ function startHybridServer() {
             'x-api-key': digiselfApiKey || '',
           },
           body: JSON.stringify({
-            output_url,
+            // Browser Direct rooms need no output_url: the agent then sends no room audio
+            output_url: output_url || undefined,
             avatar_id,
             avatar_name,
             interrupt_speech
@@ -456,16 +528,16 @@ function startHybridServer() {
 
   /* ---------- WebSocket Server Setup ---------- */
 
+  // The DigiSelf LiveKit agent sends room audio to OUTPUT_WEBSOCKET_URL. Only rooms created
+  // with Browser Direct off use it, so without the URL no agent connection is accepted.
   if (!outputWsUrl) {
-    console.error('OUTPUT_WEBSOCKET_URL is not defined');
-    process.exit(1);
+    console.warn('OUTPUT_WEBSOCKET_URL is not set: only Browser Direct mode is available');
   }
 
-  const { pathname } = new URL(outputWsUrl);
-  const wss = new WebSocketServer({
-    server: server,
-    path: pathname
-  });
+  const pathname = outputWsUrl ? new URL(outputWsUrl).pathname : null;
+  const wss = new WebSocketServer(outputWsUrl
+    ? { server: server, path: pathname }
+    : { noServer: true });
 
   // WebSocket connection handler
   wss.on('connection', (ws) => {
@@ -487,11 +559,13 @@ function startHybridServer() {
         if (!clientConnections.has(key)) {
           const clientData = {
             session: null,
-            agent: null,
             roomName,
             participantId,
             streamWs: null,
+            currentOpenAIResponseId: null,
             currentOpenAIRequestId: null,
+            audioParticipants: new Map(),
+            audioSource: null,
             audioRequestProcessed: false,
             textMetadataSent: false,
             audioMetadataSent: false,
@@ -543,8 +617,9 @@ function startHybridServer() {
           return;
         }
 
-        // Handle audio messages from agent
-        if (payload.type === 'mixed' || payload.type === 'individual') {
+        // Handle audio messages from agent (only one of individual or mixed, see selectAudioSource)
+        if ((payload.type === 'mixed' || payload.type === 'individual') &&
+            selectAudioSource(clientData, payload) === payload.type) {
           const audioChunk = Buffer.from(payload.data, 'base64');
 
           // Forward audio to OpenAI for text and audio modes
@@ -567,19 +642,20 @@ function startHybridServer() {
       }
     });
 
+    // Clean up by room even when no participant_id has arrived (a room where only
+    // mixed audio was sent), otherwise its OpenAI session and Stream API
+    // reconnect loop would leak.
     ws.on('close', () => {
       console.log(`WebSocket client disconnected: ${participantId}`);
-      if (participantId && roomName) {
-        const key = clientKey(roomName, participantId);
-        cleanupClientConnection(key);
+      if (roomName) {
+        cleanupClientConnection(clientKey(roomName, participantId));
       }
     });
 
     ws.on('error', (error) => {
       console.error(`WebSocket error for ${participantId}:`, error);
-      if (participantId && roomName) {
-        const key = clientKey(roomName, participantId);
-        cleanupClientConnection(key);
+      if (roomName) {
+        cleanupClientConnection(clientKey(roomName, participantId));
       }
     });
   });
@@ -588,13 +664,14 @@ function startHybridServer() {
   server.listen(httpPort, () => {
     console.log(`\n🚀 Hybrid HTTP/WebSocket server listening on port ${httpPort}`);
     console.log(`   - HTTP endpoints: http://localhost:${httpPort}`);
-    console.log(`   - WebSocket path: ws://localhost:${httpPort}${pathname}`);
+    console.log(`   - WebSocket path: ${pathname ? `ws://localhost:${httpPort}${pathname}` : '(disabled, Browser Direct only)'}`);
     console.log(`   - Audio file available at: http://localhost:${httpPort}/testcase_1.wav`);
     console.log('\n=== API Endpoints ===');
     console.log(`GET  http://localhost:${httpPort}/api/admin/status`);
     console.log(`POST http://localhost:${httpPort}/api/admin/mode`);
     console.log(`POST http://localhost:${httpPort}/api/admin/rooms/:roomName/mode`);
     console.log(`POST http://localhost:${httpPort}/api/rooms/:roomName/voice`);
+    console.log(`POST http://localhost:${httpPort}/api/openai/session`);
     console.log('===========================\n');
   });
 

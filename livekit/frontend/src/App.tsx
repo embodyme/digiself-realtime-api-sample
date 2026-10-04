@@ -6,17 +6,16 @@ import {
   useTracks,
   RoomContext,
 } from '@livekit/components-react';
-import { Room, Track } from 'livekit-client';
+import { Room, RoomEvent, Track } from 'livekit-client';
 import '@livekit/components-styles';
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
+import { BrowserDirectConnection } from './browserDirect';
 
 const LIVEKIT_SERVER_URL = 'wss://digiself-production-uit7o53m.livekit.cloud';
-const OUTPUT_WEBSOCKET_URL = import.meta.env.VITE_OUTPUT_WEBSOCKET_URL;
+const STREAM_API_URL = 'wss://stream-api.digiself.tech';
+// Only needed when Browser Direct is off (the DigiSelf agent sends room audio to this URL)
+const OUTPUT_WEBSOCKET_URL = import.meta.env.VITE_OUTPUT_WEBSOCKET_URL || '';
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
-
-if (!OUTPUT_WEBSOCKET_URL) {
-  throw new Error("Environment variable VITE_OUTPUT_WEBSOCKET_URL must be set.");
-}
 
 export default function App() {
   const [room] = useState(() => new Room({
@@ -30,12 +29,38 @@ export default function App() {
   const [avatarName, setAvatarName] = useState('');
   const [outputUrl, setOutputUrl] = useState(OUTPUT_WEBSOCKET_URL);
   const [voiceId, setVoiceId] = useState('');
-  const [interruptSpeech, setInterruptSpeech] = useState(true);
+  const [interruptSpeech, setInterruptSpeech] = useState(false);
+  const [browserDirect, setBrowserDirect] = useState(false);
+  const [audioFileUrl, setAudioFileUrl] = useState('');
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [progress, setProgress] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
+  const [browserDirectSession, setBrowserDirectSession] = useState(false);
+  const [audioPrewarm, setAudioPrewarm] = useState(false);
+  const [micEnabled, setMicEnabled] = useState(true);
   const isConnectingRef = useRef(false);
+  const browserDirectRef = useRef<BrowserDirectConnection | null>(null);
+
+  // Return to the start screen whenever the room disconnects (leave button or room closed)
+  useEffect(() => {
+    const handleDisconnected = () => {
+      browserDirectRef.current?.close();
+      browserDirectRef.current = null;
+      setBrowserDirectSession(false);
+      setIsConnected(false);
+    };
+    room.on(RoomEvent.Disconnected, handleDisconnected);
+    return () => {
+      room.off(RoomEvent.Disconnected, handleDisconnected);
+    };
+  }, [room]);
+
+  const toggleMic = async () => {
+    const enabled = !micEnabled;
+    setMicEnabled(enabled);
+    await browserDirectRef.current?.setMicEnabled(enabled);
+  };
 
   const getProgressLabel = (progress: string): string => {
     switch (progress) {
@@ -124,6 +149,14 @@ export default function App() {
     if (isConnectingRef.current || !userName.trim()) {
       return;
     }
+    if (!browserDirect && !outputUrl.trim()) {
+      setError('Output URL is required when Browser Direct is off.');
+      return;
+    }
+    if (browserDirect && mode === 'file' && !audioFileUrl.trim()) {
+      setError('Audio File URL is required for File Mode with Browser Direct.');
+      return;
+    }
 
     setIsConnecting(true);
     setProgress('');
@@ -138,7 +171,8 @@ export default function App() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          output_url: outputUrl.trim(),
+          // Browser Direct does not use the backend WebSocket, so no output_url is sent
+          output_url: browserDirect ? undefined : outputUrl.trim(),
           avatar_id: avatarId.trim(),
           avatar_name: avatarName.trim(),
           interrupt_speech: interruptSpeech
@@ -191,6 +225,40 @@ export default function App() {
       const createdRoomName = roomData.room_name;
       console.log(`Connecting to room: ${createdRoomName}`);
 
+      if (browserDirect) {
+        // Browser Direct: the browser talks to OpenAI and the Stream API itself
+        if (!roomData.token) {
+          throw new Error('No temporary token in the room creation result.');
+        }
+        const token = await getParticipantToken(createdRoomName);
+        await room.connect(LIVEKIT_SERVER_URL, token);
+
+        // Start playing the avatar audio before the setup below (see HiddenRoomAudioPrewarm)
+        setAudioPrewarm(true);
+        await waitForNextPaint();
+
+        const conn = new BrowserDirectConnection({
+          room,
+          roomName: createdRoomName,
+          mode,
+          streamApiToken: roomData.token,
+          streamApiUrl: STREAM_API_URL,
+          backendUrl: BACKEND_URL,
+          voiceId: voiceId.trim(),
+          audioFileUrl: audioFileUrl.trim(),
+          interruptSpeech,
+          onStatusChange: (status) => console.log('[BrowserDirect]', status),
+          onError: setError,
+        });
+        browserDirectRef.current = conn;
+        await conn.connect();
+
+        setMicEnabled(true);
+        setBrowserDirectSession(true);
+        setIsConnected(true);
+        return;
+      }
+
       // Send voice_id to livekit-backend BEFORE setting mode (for text mode)
       // This ensures voice_id is available when mode switch triggers metadata send
       // Always send voice_id (even if empty) to add timing buffer before WebSocket connects
@@ -213,7 +281,13 @@ export default function App() {
     } catch (error) {
       console.error("LiveKit connection failed:", error);
       setError(error instanceof Error ? error.message : 'Connection failed');
+      // Release whatever was set up before the failure
+      browserDirectRef.current?.close();
+      browserDirectRef.current = null;
+      await room.disconnect();
     } finally {
+      // The in-room view has its own RoomAudioRenderer
+      setAudioPrewarm(false);
       setIsConnecting(false);
       isConnectingRef.current = false;
     }
@@ -341,7 +415,7 @@ export default function App() {
                   />
                   <div>
                     <div style={{ fontWeight: 'bold', color: '#333' }}>Text Mode</div>
-                    <div style={{ fontSize: '12px', color: '#666' }}>Google Gemini Live API (16kHz)</div>
+                    <div style={{ fontSize: '12px', color: '#666' }}>OpenAI gpt-realtime</div>
                   </div>
                 </label>
                 <label style={{
@@ -366,7 +440,7 @@ export default function App() {
                   />
                   <div>
                     <div style={{ fontWeight: 'bold', color: '#333' }}>Audio Mode</div>
-                    <div style={{ fontSize: '12px', color: '#666' }}>OpenAI Realtime API (24kHz)</div>
+                    <div style={{ fontSize: '12px', color: '#666' }}>OpenAI gpt-realtime</div>
                   </div>
                 </label>
                 <label style={{
@@ -455,34 +529,70 @@ export default function App() {
                 disabled={isConnecting}
               />
             </div>
-            <div>
-              <label htmlFor="outputUrl" style={{
-                display: 'block',
-                marginBottom: '5px',
-                fontWeight: 'bold',
-                color: '#555'
-              }}>
-                Output URL:
-              </label>
-              <input
-                id="outputUrl"
-                type="text"
-                value={outputUrl}
-                onChange={(e) => setOutputUrl(e.target.value)}
-                style={{
-                  width: '100%',
-                  padding: '12px',
-                  border: '2px solid #ddd',
-                  borderRadius: '6px',
-                  fontSize: '16px',
-                  boxSizing: 'border-box',
-                  marginBottom: '10px',
-                  backgroundColor: 'white',
-                  color: 'black'
-                }}
-                disabled={isConnecting}
-              />
-            </div>
+            {/* Output URL - the backend WebSocket is only used when Browser Direct is off */}
+            {!browserDirect && (
+              <div>
+                <label htmlFor="outputUrl" style={{
+                  display: 'block',
+                  marginBottom: '5px',
+                  fontWeight: 'bold',
+                  color: '#555'
+                }}>
+                  Output URL:
+                </label>
+                <input
+                  id="outputUrl"
+                  type="text"
+                  value={outputUrl}
+                  onChange={(e) => setOutputUrl(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '12px',
+                    border: '2px solid #ddd',
+                    borderRadius: '6px',
+                    fontSize: '16px',
+                    boxSizing: 'border-box',
+                    marginBottom: '10px',
+                    backgroundColor: 'white',
+                    color: 'black'
+                  }}
+                  disabled={isConnecting}
+                />
+              </div>
+            )}
+
+            {/* Audio File URL - sent to the Stream API by the browser in File Mode */}
+            {browserDirect && mode === 'file' && (
+              <div>
+                <label htmlFor="audioFileUrl" style={{
+                  display: 'block',
+                  marginBottom: '5px',
+                  fontWeight: 'bold',
+                  color: '#555'
+                }}>
+                  Audio File URL:
+                </label>
+                <input
+                  id="audioFileUrl"
+                  type="text"
+                  value={audioFileUrl}
+                  onChange={(e) => setAudioFileUrl(e.target.value)}
+                  placeholder="https://example.com/audio.wav"
+                  style={{
+                    width: '100%',
+                    padding: '12px',
+                    border: '2px solid #ddd',
+                    borderRadius: '6px',
+                    fontSize: '16px',
+                    boxSizing: 'border-box',
+                    marginBottom: '10px',
+                    backgroundColor: 'white',
+                    color: 'black'
+                  }}
+                  disabled={isConnecting}
+                />
+              </div>
+            )}
 
             {/* Voice ID field - only for text mode */}
             {mode === 'text' && (
@@ -517,50 +627,21 @@ export default function App() {
               </div>
             )}
 
-            <div style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '10px',
-              marginBottom: '10px'
-            }}>
-              <label htmlFor="interruptSpeech" style={{
-                fontWeight: 'bold',
-                color: '#555',
-                cursor: 'pointer'
-              }}>
-                Interrupt Speech:
-              </label>
-              <button
-                id="interruptSpeech"
-                type="button"
-                onClick={() => setInterruptSpeech(!interruptSpeech)}
-                disabled={isConnecting}
-                style={{
-                  width: '50px',
-                  height: '26px',
-                  borderRadius: '13px',
-                  border: 'none',
-                  backgroundColor: interruptSpeech ? '#28a745' : '#ccc',
-                  position: 'relative',
-                  cursor: isConnecting ? 'not-allowed' : 'pointer',
-                  transition: 'background-color 0.2s'
-                }}
-              >
-                <span style={{
-                  position: 'absolute',
-                  top: '3px',
-                  left: interruptSpeech ? '27px' : '3px',
-                  width: '20px',
-                  height: '20px',
-                  borderRadius: '50%',
-                  backgroundColor: 'white',
-                  transition: 'left 0.2s'
-                }} />
-              </button>
-              <span style={{ color: '#666', fontSize: '14px' }}>
-                {interruptSpeech ? 'ON' : 'OFF'}
-              </span>
-            </div>
+            <ToggleSwitch
+              id="browserDirect"
+              label="Browser Direct:"
+              description="The browser talks to OpenAI and the DigiSelf Stream API directly. No backend WebSocket (ngrok) is needed."
+              value={browserDirect}
+              onChange={setBrowserDirect}
+              disabled={isConnecting}
+            />
+            <ToggleSwitch
+              id="interruptSpeech"
+              label="Interrupt Speech:"
+              value={interruptSpeech}
+              onChange={setInterruptSpeech}
+              disabled={isConnecting}
+            />
             <button
               onClick={createAndJoinRoom}
               disabled={isConnecting || !userName.trim()}
@@ -648,6 +729,8 @@ export default function App() {
             </div>
           )}
         </div>
+
+        {audioPrewarm && <HiddenRoomAudioPrewarm room={room} />}
       </div>
     );
   }
@@ -655,15 +738,130 @@ export default function App() {
   return (
     <RoomContext.Provider value={room}>
       <div data-lk-theme="default" style={{ height: '100vh' }}>
-        <MyVideoConference />
+        <MyVideoConference excludeLocal={browserDirectSession} />
         <RoomAudioRenderer />
-        <ControlBar />
+        {browserDirectSession ? (
+          <BrowserDirectControls
+            micEnabled={micEnabled}
+            onToggleMic={toggleMic}
+            onLeave={() => room.disconnect()}
+          />
+        ) : (
+          <ControlBar />
+        )}
       </div>
     </RoomContext.Provider>
   );
 }
 
-function MyVideoConference() {
+// Plays the avatar audio while Browser Direct is still starting. Chrome keeps receiving
+// remote audio that no element plays and buffers it, so a renderer mounted seconds later
+// would start that far behind the avatar video and only slowly catch up.
+function HiddenRoomAudioPrewarm({ room }: { room: Room }) {
+  return (
+    <RoomContext.Provider value={room}>
+      <div
+        aria-hidden="true"
+        style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', opacity: 0, pointerEvents: 'none' }}
+      >
+        <RoomAudioRenderer />
+      </div>
+    </RoomContext.Provider>
+  );
+}
+
+// Resolves once the next frame has been painted. requestAnimationFrame does not run in
+// background tabs, so a timer resolves it there.
+function waitForNextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, 200);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      clearTimeout(timer);
+      resolve();
+    }));
+  });
+}
+
+function ToggleSwitch({ id, label, description, value, onChange, disabled }: {
+  id: string;
+  label: string;
+  description?: string;
+  value: boolean;
+  onChange: (value: boolean) => void;
+  disabled: boolean;
+}) {
+  return (
+    <div style={{ marginBottom: '10px' }}>
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: '10px'
+      }}>
+        <label htmlFor={id} style={{
+          fontWeight: 'bold',
+          color: '#555',
+          cursor: 'pointer'
+        }}>
+          {label}
+        </label>
+        <button
+          id={id}
+          type="button"
+          onClick={() => onChange(!value)}
+          disabled={disabled}
+          style={{
+            width: '50px',
+            height: '26px',
+            borderRadius: '13px',
+            border: 'none',
+            backgroundColor: value ? '#28a745' : '#ccc',
+            position: 'relative',
+            cursor: disabled ? 'not-allowed' : 'pointer',
+            transition: 'background-color 0.2s'
+          }}
+        >
+          <span style={{
+            position: 'absolute',
+            top: '3px',
+            left: value ? '27px' : '3px',
+            width: '20px',
+            height: '20px',
+            borderRadius: '50%',
+            backgroundColor: 'white',
+            transition: 'left 0.2s'
+          }} />
+        </button>
+        <span style={{ color: '#666', fontSize: '14px' }}>
+          {value ? 'ON' : 'OFF'}
+        </span>
+      </div>
+      {description && (
+        <div style={{ fontSize: '12px', color: '#666', marginTop: '4px' }}>{description}</div>
+      )}
+    </div>
+  );
+}
+
+// In Browser Direct the browser microphone goes to both OpenAI and LiveKit, so the
+// LiveKit ControlBar is replaced with a button that mutes both at once.
+function BrowserDirectControls({ micEnabled, onToggleMic, onLeave }: {
+  micEnabled: boolean;
+  onToggleMic: () => void;
+  onLeave: () => void;
+}) {
+  return (
+    <div className="lk-control-bar">
+      <button className="lk-button" onClick={onToggleMic} aria-pressed={micEnabled}>
+        {micEnabled ? 'Mute Microphone' : 'Unmute Microphone'}
+      </button>
+      <button className="lk-button lk-disconnect-button" onClick={onLeave}>
+        Leave
+      </button>
+    </div>
+  );
+}
+
+function MyVideoConference({ excludeLocal }: { excludeLocal: boolean }) {
   const tracks = useTracks(
     [
       { source: Track.Source.Camera, withPlaceholder: true },
@@ -672,9 +870,11 @@ function MyVideoConference() {
     { onlySubscribed: false },
   );
 
-  // Filter out tracks from LiveKit Agents (IDs starting with "agent")
+  // Filter out tracks from LiveKit Agents (IDs starting with "agent"), and in Browser
+  // Direct also the user's own tile so that only the avatar is shown
   const filteredTracks = tracks.filter(
-    (track) => !track.participant.identity.startsWith('agent')
+    (track) => !track.participant.identity.startsWith('agent') &&
+      !(excludeLocal && track.participant.isLocal)
   );
 
   return (

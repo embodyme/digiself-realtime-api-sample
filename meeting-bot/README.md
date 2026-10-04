@@ -7,13 +7,13 @@ A sample application demonstrating real-time avatar interaction in Google Meet u
 This application consists of two components:
 
 - **Frontend**: A React application that provides a web interface to control the meeting bot
-- **Backend**: A Node.js server that bridges meeting bot audio streams to AI services (OpenAI Realtime API) and the Digiself streaming API
+- **Backend**: A Node.js server that bridges meeting bot audio streams to AI services (OpenAI Realtime API, gpt-realtime-2.1) and the Digiself streaming API
 
 ## Prerequisites
 
 - Docker
 - [ngrok](https://ngrok.com/) account and CLI
-- OpenAI API Key (for text and audio modes)
+- OpenAI API Key with access to gpt-realtime-2.1 (for text and audio modes)
 - Digiself API Key
 
 ## ngrok Setup
@@ -80,8 +80,8 @@ The application supports three streaming modes:
 
 | Mode | Description | API Used |
 |------|-------------|----------|
-| **Text** | Transcribes speech and generates text responses with TTS | OpenAI Realtime API |
-| **Audio** | Direct audio-to-audio conversation | OpenAI Realtime API |
+| **Text** | Generates text-only responses (`output_modalities: ['text']`) that DigiSelf speaks with its TTS | OpenAI Realtime API (gpt-realtime-2.1) |
+| **Audio** | Direct audio-to-audio conversation; the generated audio is streamed to DigiSelf | OpenAI Realtime API (gpt-realtime-2.1) |
 | **File** | Plays pre-recorded audio from a URL | Static file |
 
 ## License

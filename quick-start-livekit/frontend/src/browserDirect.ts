@@ -15,6 +15,7 @@ export class BrowserDirectConnection {
   private dataChannel: RTCDataChannel | null = null;
   private micTrack: MediaStreamTrack | null = null;
   private streamApiWs: WebSocket | null = null;
+  private currentResponseId: string | null = null;
   private currentRequestId: string | null = null;
   private streamApiConfigAcked = false;
   private closed = false;
@@ -169,6 +170,9 @@ export class BrowserDirectConnection {
   }
 
   private handleOpenAIMessage(event: MessageEvent): void {
+    // Ignore events that arrive after the connection was closed
+    if (this.closed) return;
+
     let message: Record<string, unknown>;
     try {
       message = JSON.parse(event.data as string);
@@ -178,6 +182,13 @@ export class BrowserDirectConnection {
     }
 
     const type = message.type as string;
+
+    // Ignore the rest of responses that already finished or were interrupted
+    const response = message.response as { id?: string } | undefined;
+    const responseId = typeof message.response_id === 'string' ? message.response_id : response?.id;
+    if (type.startsWith('response.') && type !== 'response.created' && responseId !== this.currentResponseId) {
+      return;
+    }
 
     switch (type) {
       case 'session.created':
@@ -190,6 +201,10 @@ export class BrowserDirectConnection {
 
       case 'input_audio_buffer.speech_started':
         console.log('[BrowserDirect] Speech started');
+        // Server VAD cancels the current response when the user starts speaking,
+        // so stop forwarding what is left of it.
+        this.currentResponseId = null;
+        this.currentRequestId = null;
         break;
 
       case 'input_audio_buffer.speech_stopped':
@@ -197,43 +212,45 @@ export class BrowserDirectConnection {
         break;
 
       case 'response.created':
+        this.currentResponseId = response?.id ?? null;
         this.currentRequestId = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
         console.log('[BrowserDirect] Response created, request_id:', this.currentRequestId);
         break;
 
-      case 'response.output_audio_transcript.delta': {
-        // Forward text to Stream API (text mode only)
-        if (this.streamApiConfigAcked) {
-          const delta = message.delta as string;
-          if (delta && this.streamApiWs?.readyState === WebSocket.OPEN) {
-            if (!this.currentRequestId) {
-              this.currentRequestId = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-            }
-            this.streamApiWs.send(JSON.stringify({
-              type: 'text_stream',
-              payload: {
-                text: delta,
-                request_id: this.currentRequestId,
-              },
-            }));
-          }
+      case 'response.output_text.delta': {
+        // Forward text to Stream API (the session outputs text only)
+        const delta = message.delta as string;
+        if (delta && this.currentRequestId && this.streamApiConfigAcked && this.streamApiWs?.readyState === WebSocket.OPEN) {
+          this.streamApiWs.send(JSON.stringify({
+            type: 'text_stream',
+            payload: {
+              text: delta,
+              request_id: this.currentRequestId,
+            },
+          }));
         }
         break;
       }
 
-      case 'response.output_audio_transcript.done':
-        console.log('[BrowserDirect] Text response completed');
+      case 'response.output_text.done':
+        console.log('[BrowserDirect] Text response completed:', message.text);
         break;
 
       case 'response.done':
         console.log('[BrowserDirect] Response completed');
+        this.currentResponseId = null;
         this.currentRequestId = null;
         break;
 
-      case 'error':
+      case 'error': {
+        // Server VAD requests a response whenever the user stops speaking. While an answer
+        // is still being generated, OpenAI rejects that request and keeps the answer.
+        const error = message.error as { code?: string } | undefined;
+        if (error?.code === 'conversation_already_has_active_response') break;
         console.error('[BrowserDirect] OpenAI error:', message.error);
         this.config.onError?.(`OpenAI error: ${JSON.stringify(message.error)}`);
         break;
+      }
     }
   }
 

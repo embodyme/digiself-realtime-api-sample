@@ -1,12 +1,12 @@
 # Quick Start - LiveKit Avatar Demo
 
-A minimal implementation with LiveKit, OpenAI Realtime API, and Digiself Stream API.
+A minimal implementation with LiveKit, OpenAI Realtime API (gpt-realtime-2.1, text output), and Digiself Stream API.
 
 ## Prerequisites
 
 - Node.js 20.x or later
 - npm or yarn
-- OpenAI API Key
+- OpenAI API Key with access to gpt-realtime-2.1
 - Digiself API Key
 - LiveKit server URL (provided by Digiself)
 

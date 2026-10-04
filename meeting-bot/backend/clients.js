@@ -5,10 +5,12 @@
  */
 
 import WebSocket from 'ws';
-import { RealtimeAgent, RealtimeSession } from '@openai/agents/realtime';
+import { OpenAIRealtimeSession } from './openaiRealtime.js';
 import {
   streamApiUrlBase,
   openaiApiKey,
+  openaiRealtimeModel,
+  realtimeSessionConfig,
   digiselfApiKey,
   audioUrl,
   audioAuthToken,
@@ -178,64 +180,41 @@ export function createStreamAPIConnection(botId) {
 
 /**
  * Creates an OpenAI Realtime API connection for a bot.
- * Configures audio format (PCM16, 24kHz) and server-side VAD.
+ * Text mode requests text output and audio mode requests audio output
+ * (see realtimeSessionConfig in config.js).
  *
  * @param {string} botId - The bot ID
- * @returns {Promise<object>} The bot data with session and agent
+ * @returns {Promise<object>} The bot data with session
  */
 export async function createRealtimeConnection(botId) {
   const botData = botConnections.get(botId);
 
   // Skip for file mode (no AI session needed)
-  if (botData && botData.mode === 'file') return;
+  if (!botData || botData.mode === 'file') return;
 
   console.log(`[OpenAI Realtime] Creating new connection for bot: ${botId}`);
 
-  const agent = new RealtimeAgent({
+  const session = new OpenAIRealtimeSession({
     apiKey: openaiApiKey,
-    name: 'assistant',
-    instructions: `You are a helpful AI assistant.
-    Keep your responses concise and natural. You are having a real-time conversation with the user.`,
-  });
-
-  const session = new RealtimeSession(agent, {
-    model: 'gpt-realtime',
-    transport: 'websocket',
-    config: {
-      audio: {
-        input: {
-          format: {
-            type: 'audio/pcm',
-            rate: 24000
-          }
-        },
-        output: {
-          format: {
-            type: 'audio/pcm',
-            rate: 24000
-          }
-        },
-      },
-      turn_detection: {
-        type: 'server_vad',
-        threshold: 0.5,
-        prefix_padding_ms: 300,
-        silence_duration_ms: 500
-      }
-    },
+    session: realtimeSessionConfig(botData.mode),
+    onEvent: (event) => handleRealtimeEvent(botId, event),
+    onError: (error) => {
+      console.error(`[OpenAI Realtime] Connection lost for bot ${botId}:`, error.message);
+    }
   });
 
   try {
-    await session.connect({
-      apiKey: openaiApiKey,
-    });
+    await session.connect();
+
+    // The bot may have been cleaned up while connecting
     const updatedBotData = botConnections.get(botId);
+    if (!updatedBotData) {
+      session.close();
+      return;
+    }
     updatedBotData.session = session;
-    updatedBotData.agent = agent;
 
-    setupRealtimeEventHandlers(session, botId);
-
-    console.log(`[OpenAI Realtime] Connection established for bot: ${botId}`);
+    console.log(`[OpenAI Realtime] Connection established for bot: ${botId} (${openaiRealtimeModel}, ${botData.mode} output)`);
     return updatedBotData;
   } catch (error) {
     console.error(`[OpenAI Realtime] Failed to create connection for bot ${botId}:`, error);
@@ -246,113 +225,110 @@ export async function createRealtimeConnection(botId) {
 /* ---------- Realtime Event Handlers ---------- */
 
 /**
- * Sets up event handlers for OpenAI Realtime session transport events.
+ * Handles OpenAI Realtime server events.
  * Routes text and audio responses to the Stream API based on bot mode.
  *
- * @param {RealtimeSession} session - The OpenAI Realtime session
  * @param {string} botId - The bot ID
+ * @param {object} event - The OpenAI Realtime server event
  */
-function setupRealtimeEventHandlers(session, botId) {
+function handleRealtimeEvent(botId, event) {
   const botData = botConnections.get(botId);
   if (!botData) return;
 
-  session.transport.on('*', (event) => {
-    switch (event.type) {
-      case 'input_audio_buffer.speech_started': {
-        console.log('[OpenAI] Speech started detected');
-        break;
-      }
+  // Ignore the rest of responses that already finished or were interrupted
+  const responseId = event.response_id || event.response?.id;
+  if (event.type.startsWith('response.') && event.type !== 'response.created' &&
+      responseId !== botData.currentResponseId) {
+    return;
+  }
 
-      case 'input_audio_buffer.speech_stopped': {
-        console.log('[OpenAI] Speech stopped, triggering response');
-        break;
-      }
-
-      case 'input_audio_buffer.committed': {
-        console.log('[OpenAI] Audio buffer committed');
-        break;
-      }
-
-      case 'response.created': {
-        // Generate a new request_id when a new response starts
-        botData.currentRequestId = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-        console.log('[OpenAI] Response created, new request_id:', botData.currentRequestId);
-        break;
-      }
-
-      case 'response.output_audio_transcript.delta': {
-        // Send text chunks immediately as they arrive (streaming)
-        const chunkText = event.delta;
-        if (chunkText) {
-          console.log(`[OpenAI Realtime] Text chunk for bot ${botId}:`, chunkText);
-          // Send text chunks if bot mode is 'text'
-          if (botData.mode === 'text' &&
-              botData.streamWs &&
-              botData.streamWs.readyState === WebSocket.OPEN &&
-              botData.textMetadataSent) {
-            // Ensure we have a request_id
-            if (!botData.currentRequestId) {
-              botData.currentRequestId = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-            }
-            botData.streamWs.send(JSON.stringify({
-              type: 'text_stream',
-              payload: {
-                text: chunkText,
-                request_id: botData.currentRequestId
-              }
-            }));
-          }
-        }
-        break;
-      }
-
-      case 'response.output_audio_transcript.done': {
-        const text = event.transcript;
-        console.log(`[OpenAI Realtime] Text response completed for bot ${botId}:`, text);
-        break;
-      }
-
-      case 'response.output_audio.delta': {
-        console.log('audio delta received', performance.now());
-        const delta = event.delta;
-        console.log(`[OpenAI] Delta type: ${typeof delta}, length: ${delta?.length}, preview: ${delta?.substring?.(0, 50)}`);
-
-        // Only send audio data if bot mode is 'audio'
-        if (botData.mode === 'audio' &&
-            delta &&
-            botData.streamWs &&
-            botData.streamWs.readyState === WebSocket.OPEN &&
-            botData.audioMetadataSent) {
-          // Ensure we have a request_id
-          if (!botData.currentRequestId) {
-            botData.currentRequestId = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-          }
-
-          const message = {
-            type: 'audio_stream',
-            payload: {
-              audio_data: delta,
-              request_id: botData.currentRequestId
-            }
-          };
-          console.log(`[OpenAI] Sending message:`, JSON.stringify(message).substring(0, 200));
-          botData.streamWs.send(JSON.stringify(message));
-        }
-        break;
-      }
-
-      case 'response.output_audio.done': {
-        console.log(`[OpenAI] Turn completed, request_id: ${botData.currentRequestId}`);
-        // Reset request_id when response is done
-        botData.currentRequestId = null;
-        break;
-      }
+  switch (event.type) {
+    case 'input_audio_buffer.speech_started': {
+      console.log('[OpenAI] Speech started detected');
+      // Server VAD cancels the current response when a participant starts speaking,
+      // so stop forwarding what is left of it.
+      botData.currentResponseId = null;
+      botData.currentRequestId = null;
+      break;
     }
-  });
 
-  session.on('error', (error) => {
-    console.error(`[OpenAI Realtime] Error for bot ${botId}:`, error);
-  });
+    case 'input_audio_buffer.speech_stopped': {
+      console.log('[OpenAI] Speech stopped, triggering response');
+      break;
+    }
+
+    case 'input_audio_buffer.committed': {
+      console.log('[OpenAI] Audio buffer committed');
+      break;
+    }
+
+    case 'response.created': {
+      // Generate a new request_id when a new response starts
+      botData.currentResponseId = event.response.id;
+      botData.currentRequestId = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+      console.log('[OpenAI] Response created, new request_id:', botData.currentRequestId);
+      break;
+    }
+
+    case 'response.output_text.delta': {
+      // Send text chunks immediately as they arrive (streaming)
+      const chunkText = event.delta;
+      if (chunkText &&
+          botData.mode === 'text' &&
+          botData.streamWs &&
+          botData.streamWs.readyState === WebSocket.OPEN &&
+          botData.textMetadataSent) {
+        console.log(`[OpenAI Realtime] Text chunk for bot ${botId}:`, chunkText);
+        botData.streamWs.send(JSON.stringify({
+          type: 'text_stream',
+          payload: {
+            text: chunkText,
+            request_id: botData.currentRequestId
+          }
+        }));
+      }
+      break;
+    }
+
+    case 'response.output_text.done': {
+      console.log(`[OpenAI Realtime] Text response completed for bot ${botId}:`, event.text);
+      break;
+    }
+
+    case 'response.output_audio.delta': {
+      // Only send audio data if bot mode is 'audio'
+      if (event.delta &&
+          botData.mode === 'audio' &&
+          botData.streamWs &&
+          botData.streamWs.readyState === WebSocket.OPEN &&
+          botData.audioMetadataSent) {
+        botData.streamWs.send(JSON.stringify({
+          type: 'audio_stream',
+          payload: {
+            audio_data: event.delta,
+            request_id: botData.currentRequestId
+          }
+        }));
+      }
+      break;
+    }
+
+    case 'response.output_audio_transcript.done': {
+      console.log(`[OpenAI Realtime] Audio response completed for bot ${botId}:`, event.transcript);
+      break;
+    }
+
+    case 'response.done': {
+      if (event.response?.status === 'failed') {
+        console.error(`[OpenAI Realtime] Response failed for bot ${botId}:`, event.response.status_details);
+      }
+      console.log(`[OpenAI] Turn completed, request_id: ${botData.currentRequestId}`);
+      // Reset request_id when response is done
+      botData.currentResponseId = null;
+      botData.currentRequestId = null;
+      break;
+    }
+  }
 }
 
 /* ---------- Metadata Functions ---------- */
@@ -579,16 +555,14 @@ export async function switchBotMode(botId, newMode) {
 
   console.log(`[Mode Switch] Switching bot ${botId} from ${oldMode} to ${newMode}`);
 
-  // Close OpenAI session when switching to file mode
-  if ((oldMode === 'text' || oldMode === 'audio') && newMode === 'file' && botData.session) {
-    console.log(`[Mode Switch] Closing OpenAI session for bot ${botId} (switching to file mode)`);
-    try {
-      botData.session.close?.();
-    } catch (e) {
-      console.error(`[Mode Switch] Error closing OpenAI session:`, e);
-    }
+  // Close the OpenAI session: file mode needs none, and text and audio modes
+  // use different output modalities, so the session is recreated below.
+  if (botData.session) {
+    console.log(`[Mode Switch] Closing OpenAI session for bot ${botId}`);
+    botData.session.close();
     botData.session = null;
-    botData.agent = null;
+    botData.currentResponseId = null;
+    botData.currentRequestId = null;
   }
 
   botData.mode = newMode;
@@ -600,12 +574,7 @@ export async function switchBotMode(botId, newMode) {
 
   try {
     if (newMode === 'text' || newMode === 'audio') {
-      // Reuse existing OpenAI session when switching between text and audio modes
-      if (!botData.session) {
-        await createRealtimeConnection(botId);
-      } else {
-        console.log(`[Mode Switch] Reusing existing OpenAI session for bot ${botId}`);
-      }
+      await createRealtimeConnection(botId);
 
       // Reuse existing streamWs or create new one if needed
       if (!botData.streamWs || botData.streamWs.readyState !== WebSocket.OPEN) {

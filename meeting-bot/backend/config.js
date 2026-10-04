@@ -14,7 +14,7 @@ config();
 export const streamApiUrlBase = 'wss://stream-api.digiself.tech';
 
 /** Base URL for the Digiself API */
-export const digiselfApiBaseUrl = 'https://app.digiself.tech';
+export const digiselfApiBaseUrl = 'https://realtime-api.digiself.tech';
 
 /* ---------- Environment Variables ---------- */
 
@@ -32,6 +32,69 @@ export const audioUrl = process.env.AUDIO_FILE_URL;
 
 /** Authorization token for audio file access */
 export const audioAuthToken = process.env.AUDIO_AUTH_TOKEN;
+
+/* ---------- OpenAI Realtime Settings ---------- */
+
+/** OpenAI Realtime model */
+export const openaiRealtimeModel = 'gpt-realtime-2.1';
+
+/** Reasoning effort. Minimal keeps the first reply fast. */
+export const openaiRealtimeReasoningEffort = 'minimal';
+
+/**
+ * Text mode output token limit per response, including reasoning tokens.
+ * A limit of 128 cut detailed Japanese answers off mid-sentence.
+ */
+export const openaiRealtimeMaxOutputTokens = 1024;
+
+/** Server VAD: speech probability threshold, audio kept before speech, and silence that ends a turn */
+export const openaiRealtimeVadThreshold = 0.5;
+export const openaiRealtimeVadPrefixPaddingMs = 150;
+export const openaiRealtimeVadSilenceDurationMs = 100;
+
+/** Speed of the generated speech in audio mode */
+export const openaiRealtimeAudioSpeed = 1.15;
+
+/** System instructions for the assistant */
+export const openaiInstructions =
+  'You are a helpful AI assistant. Keep your responses concise and natural. You are having a real-time conversation with the user.';
+
+/**
+ * Builds the OpenAI Realtime session configuration.
+ * Text mode requests text output only, which DigiSelf speaks with its own TTS.
+ * Audio mode requests audio output, which is streamed to DigiSelf as PCM.
+ *
+ * @param {'text' | 'audio'} mode - The stream mode
+ * @returns {object} Session configuration for session.update
+ */
+export function realtimeSessionConfig(mode) {
+  return {
+    type: 'realtime',
+    model: openaiRealtimeModel,
+    instructions: openaiInstructions,
+    output_modalities: [mode === 'audio' ? 'audio' : 'text'],
+    reasoning: { effort: openaiRealtimeReasoningEffort },
+    // Audio output also counts its audio tokens (about 30 per second of speech), so the text
+    // mode limit would stop spoken answers after about 33 s. Audio mode keeps OpenAI's default.
+    max_output_tokens: mode === 'audio' ? 'inf' : openaiRealtimeMaxOutputTokens,
+    audio: {
+      input: {
+        format: { type: 'audio/pcm', rate: 24000 },
+        turn_detection: {
+          type: 'server_vad',
+          threshold: openaiRealtimeVadThreshold,
+          prefix_padding_ms: openaiRealtimeVadPrefixPaddingMs,
+          silence_duration_ms: openaiRealtimeVadSilenceDurationMs,
+          create_response: true,
+          interrupt_response: true
+        }
+      },
+      ...(mode === 'audio'
+        ? { output: { format: { type: 'audio/pcm', rate: 24000 }, speed: openaiRealtimeAudioSpeed } }
+        : {})
+    }
+  };
+}
 
 /* ---------- Global State ---------- */
 

@@ -1,11 +1,11 @@
 # Quick Start
 
-A minimal implementation that receives audio from a meeting bot, processes it through OpenAI Realtime API, and streams text responses to the Digiself Stream API.
+A minimal implementation that receives audio from a meeting bot, processes it through the OpenAI Realtime API (gpt-realtime-2.1, text output), and streams text responses to the Digiself Stream API.
 
 ## Prerequisites
 
 - Node.js 18+
-- OpenAI API key with Realtime API access
+- OpenAI API key with access to gpt-realtime-2.1
 - Digiself API key
 - [ngrok](https://ngrok.com/) account and CLI
 
@@ -34,7 +34,7 @@ This application requires ngrok to expose your local backend server to the inter
 ## Installation
 
 ```bash
-npm install ws dotenv @openai/agents
+npm install ws dotenv
 ```
 
 ## Configuration
@@ -70,13 +70,14 @@ Note: Replace `xxxx-xx-xx-xx-xx.ngrok-free.app` with your actual ngrok domain.
    Step 1: Create the bot (returns immediately with job_id):
 
    ```bash
-   curl -X POST "https://api.digiself.tech/api/bots" \
+   curl -X POST "https://realtime-api.digiself.tech/api/bots" \
      -H "x-api-key: YOUR_DIGISELF_API_KEY" \
      -H "Content-Type: application/json" \
      -d '{
        "meeting_url": "https://meet.google.com/xxx-xxxx-xxx",
        "output_url": "wss://xxxx-xx-xx-xx-xx.ngrok-free.app/ws",
-       "avatar_id": "YOUR_AVATAR_ID"
+       "avatar_id": "YOUR_AVATAR_ID",
+       "interrupt_speech": false
      }'
    ```
 
@@ -90,7 +91,7 @@ Note: Replace `xxxx-xx-xx-xx-xx.ngrok-free.app` with your actual ngrok domain.
    Step 2: Wait for the bot to be ready (long polling with 120s timeout):
 
    ```bash
-   curl -X GET "https://api.digiself.tech/api/bots/wait/{job_id}?timeout=120" \
+   curl -X GET "https://realtime-api.digiself.tech/api/bots/wait/{job_id}?timeout=120" \
      -H "x-api-key: YOUR_DIGISELF_API_KEY"
    ```
 
@@ -100,10 +101,11 @@ Note: Replace `xxxx-xx-xx-xx-xx.ngrok-free.app` with your actual ngrok domain.
    - `meeting_url`: Your Google Meet URL
    - `output_url`: Your ngrok WebSocket URL (use `wss://` protocol with `/ws` path)
    - `avatar_id`: Avatar ID from the Digiself dashboard
+   - `interrupt_speech`: `false` keeps the avatar talking when someone speaks in the meeting. If it is omitted, it defaults to `true` and the avatar stops speaking when a participant starts talking.
 
 ## How It Works
 
 1. The meeting bot connects to `ws://localhost:4000/ws` (via ngrok) and sends audio data
-2. Audio is upsampled from 16kHz to 24kHz and forwarded to OpenAI Realtime API
-3. OpenAI generates text responses
-4. Text chunks are streamed to Digiself Stream API for avatar speech synthesis
+2. Audio is upsampled from 16kHz to 24kHz and forwarded to the OpenAI Realtime API over WebSocket
+3. OpenAI (gpt-realtime-2.1) generates text-only responses (`output_modalities: ['text']`)
+4. Text chunks are streamed to Digiself Stream API with a `request_id` per response for avatar speech synthesis

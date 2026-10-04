@@ -20,7 +20,6 @@ export default function App() {
   const [meetingUrl, setMeetingUrl] = useState('');
   const [botName, setBotName] = useState('Avatar');
   const [avatarId, setAvatarId] = useState('');
-  const [outputUrl, setOutputUrl] = useState(OUTPUT_WEBSOCKET_URL);
   const [mode, setMode] = useState<'text' | 'audio' | 'file'>('text');
   const [voiceId, setVoiceId] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -59,7 +58,7 @@ export default function App() {
       const requestBody = {
         bot_name: botName.trim(),
         meeting_url: meetingUrl.trim(),
-        output_url: outputUrl.trim(),
+        output_url: OUTPUT_WEBSOCKET_URL.trim(),
         avatar_id: avatarId.trim(),
       };
       console.log('Request body:', requestBody);

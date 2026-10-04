@@ -75,8 +75,25 @@ const server = http.createServer(async (req, res) => {
         body: JSON.stringify({
           session: {
             type: 'realtime',
-            model: 'gpt-realtime',
-            instructions: 'Your are helpful assistant.',
+            model: 'gpt-realtime-2.1',
+            instructions: 'You are a helpful assistant.',
+            // Text output only: DigiSelf speaks the text with its own TTS
+            output_modalities: ['text'],
+            // Minimal reasoning keeps the first reply fast. max_output_tokens includes reasoning tokens.
+            reasoning: { effort: 'minimal' },
+            max_output_tokens: 1024,
+            audio: {
+              input: {
+                turn_detection: {
+                  type: 'server_vad',
+                  threshold: 0.5,
+                  prefix_padding_ms: 150,
+                  silence_duration_ms: 100,
+                  create_response: true,
+                  interrupt_response: true,
+                },
+              },
+            },
           },
         }),
       });
